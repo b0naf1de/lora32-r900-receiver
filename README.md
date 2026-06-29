@@ -1,6 +1,6 @@
 # lora32-r900-receiver
 
-**A standalone [Neptune R900](https://github.com/bemasher/rtlamr/wiki/Protocol#r900-consumption-message) water-meter reader for the ~$15 LilyGO LoRa32 (ESP32 + Semtech SX1276) — no RTL-SDR, no PC.**
+**A standalone [Neptune R900](https://github.com/bemasher/rtlamr/wiki/Protocol#r900-consumption-message) water-meter reader for the ~$30 LilyGO LoRa32 (ESP32 + Semtech SX1276) — no RTL-SDR, no PC.**
 
 It decodes R900 water-meter transmissions entirely on the microcontroller and publishes them to **Home Assistant over MQTT** (with auto-discovery), shows live status on the onboard **OLED**, and **self-calibrates** to a clean radio channel so it's portable to any site.
 
