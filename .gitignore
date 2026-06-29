@@ -1,0 +1,15 @@
+# Secrets — WiFi/MQTT credentials + meter id (copy secrets.h.example -> secrets.h)
+src/secrets.h
+
+# PlatformIO build output + downloaded libraries
+.pio/
+
+# Python
+**/__pycache__/
+*.pyc
+
+# Captured RF data / experiment runs (may contain neighbours' meter readings)
+experiments/results/
+
+# OS
+.DS_Store
