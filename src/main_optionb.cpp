@@ -27,10 +27,12 @@
 #include <SPI.h>
 #include <RadioLib.h>   // RADIOLIB_LOW_LEVEL=1 (build flag) exposes getMod() for direct register access
 #include <WiFi.h>
+#include <WiFiManager.h>   // tzapu: captive-portal provisioning for WiFi + MQTT params
+#include <Preferences.h>   // NVS storage for the runtime config
 #include <PubSubClient.h>
 #include <U8g2lib.h>     // SSD1306 OLED (LoRa32 V2.1.6: I2C SDA=21 SCL=22 RST=16)
 #include <Wire.h>
-#include "secrets.h"
+#include "secrets.h"     // optional compile-time DEFAULTS; the captive portal overrides these at runtime
 
 // ttgo-lora32-v21 SX1276 pins: NSS=18 DIO0=26 RST=23 DIO1=33 ; SPI SCK=5 MISO=19 MOSI=27
 SX1276 radio = new Module(18, 26, 23, 33);
@@ -110,6 +112,23 @@ static PubSubClient mqtt(espClient);
 static uint32_t     seenIds[8]; static int nSeen = 0;   // ids that already got a discovery message
 static uint32_t     lastBeat = 0;                       // last heartbeat publish (ms)
 
+// ---- runtime configuration (set via the captive portal, persisted in NVS) ----
+// secrets.h supplies the compile-time defaults; the portal overrides them and stores to flash.
+// This board (Lilygo T3 v1.6.x) has NO BOOT button, so the portal is triggered by DOUBLE-TAPPING
+// the RST button. The "armed" flag is stored in NVS/flash, NOT RTC memory: the physical RST button
+// drives the EN pin, a full hardware reset that WIPES RTC RAM on the ESP32 (RTC double-reset never
+// fires). Flash survives it. Each boot arms the flag for ~3s; a 2nd reset in that window leaves it
+// armed, and the next boot reads it set -> force portal.
+#define PRODUCT_NAME  "R900 Reader"      // shown on the OLED + as the captive-portal heading
+#define CFG_AP_NAME   "R900-Reader-Setup"
+#define DRD_WINDOW_MS 3000               // double-tap window
+static Preferences  prefs;
+static char         cfgServer[40];       // MQTT broker host/IP
+static uint16_t     cfgPort = 1883;      // MQTT port
+static char         cfgUser[32];         // MQTT username
+static char         cfgPass[48];         // MQTT password
+static uint32_t     gMeterId = 0;        // the meter the OLED tracks (0 = none/any)
+
 // HA connectivity binary_sensor for the board itself (fed by LWT/birth/heartbeat on AVAIL_TOPIC).
 static void publishReaderDiscovery() {
   char p[400];
@@ -121,10 +140,10 @@ static void publishReaderDiscovery() {
 }
 
 static void mqttEnsure() {
-  if (WiFi.status() != WL_CONNECTED || mqtt.connected()) return;
+  if (WiFi.status() != WL_CONNECTED || mqtt.connected() || cfgServer[0] == '\0') return;
   String cid = "lora32r900-" + String((uint32_t)ESP.getEfuseMac(), HEX);
   // LWT: if we drop without a clean disconnect, the broker retains "offline" on AVAIL_TOPIC.
-  if (mqtt.connect(cid.c_str(), AIO_USERNAME, AIO_KEY, AVAIL_TOPIC, 0, true, "offline")) {
+  if (mqtt.connect(cid.c_str(), cfgUser, cfgPass, AVAIL_TOPIC, 0, true, "offline")) {
     mqtt.publish(AVAIL_TOPIC, "online", true);   // birth (retained, overwrites the previous value)
     lastBeat = millis();
     publishReaderDiscovery();
@@ -226,7 +245,7 @@ static void drawDisplay() {
   u8g2.setFont(u8g2_font_6x12_tf);
   if (!haveMy) {
     u8g2.drawStr(0, 30, "Waiting for meter");
-    char m[24]; snprintf(m, sizeof(m), "%u ...", (unsigned)MY_METER_ID);
+    char m[24]; snprintf(m, sizeof(m), gMeterId ? "%u ..." : "(any)", (unsigned)gMeterId);
     u8g2.drawStr(0, 44, m);
   } else {
     char l[24];
@@ -239,6 +258,82 @@ static void drawDisplay() {
     u8g2.drawStr(0, 62, l);
   }
   u8g2.sendBuffer();
+}
+
+// shown on the OLED while the WiFiManager captive portal is open (first boot or BOOT-button forced)
+static void portalOnOLED(WiFiManager *) {
+  if (!oledPresent) return;
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x12_tf);
+  u8g2.drawStr(0, 12, "WiFi/MQTT setup");
+  u8g2.drawHLine(0, 15, 128);
+  u8g2.drawStr(0, 30, "1. Join WiFi:");
+  u8g2.drawStr(6, 42, CFG_AP_NAME);
+  u8g2.drawStr(0, 58, "2. open 192.168.4.1");
+  u8g2.sendBuffer();
+}
+
+// Load saved config (or secrets.h defaults) from NVS, then run WiFiManager. Blocks in the captive
+// portal only on first setup, if creds are missing, or when BOOT is held during reset.
+static void runProvisioning(bool forcePortal) {
+  prefs.begin("r900", false);
+  prefs.getString("server", AIO_SERVER).toCharArray(cfgServer, sizeof(cfgServer));
+  cfgPort = prefs.getUShort("port", AIO_SERVERPORT);
+  prefs.getString("user", AIO_USERNAME).toCharArray(cfgUser, sizeof(cfgUser));
+  prefs.getString("pass", AIO_KEY).toCharArray(cfgPass, sizeof(cfgPass));
+  gMeterId = prefs.getUInt("meter", MY_METER_ID);
+
+  // If WiFi was never stored but secrets.h provides creds, connect with them first (no portal needed).
+  // Wait for a full connection (WL_CONNECTED implies DHCP done on ESP32) so we don't race autoConnect.
+  if (WiFi.SSID().isEmpty() && strlen(WLAN_SSID) > 0) {
+    WiFi.begin(WLAN_SSID, WLAN_PASS);
+    for (int i = 0; i < 32 && WiFi.status() != WL_CONNECTED; i++) delay(250);   // up to 8s
+  }
+
+  char portBuf[8]; snprintf(portBuf, sizeof(portBuf), "%u", cfgPort);
+  char meterBuf[12]; snprintf(meterBuf, sizeof(meterBuf), "%u", (unsigned)gMeterId);
+  WiFiManager wm;
+  WiFiManagerParameter p_server("server", "MQTT server (IP/host)", cfgServer, sizeof(cfgServer) - 1);
+  WiFiManagerParameter p_port  ("port",   "MQTT port",            portBuf,   sizeof(portBuf) - 1);
+  WiFiManagerParameter p_user  ("user",   "MQTT username",        cfgUser,   sizeof(cfgUser) - 1);
+  WiFiManagerParameter p_pass  ("pass",   "MQTT password",        cfgPass,   sizeof(cfgPass) - 1);
+  WiFiManagerParameter p_meter ("meter",  "Meter ID (0 = any)",   meterBuf,  sizeof(meterBuf) - 1);
+  wm.addParameter(&p_server); wm.addParameter(&p_port); wm.addParameter(&p_user);
+  wm.addParameter(&p_pass);   wm.addParameter(&p_meter);
+  wm.setAPCallback(portalOnOLED);
+  wm.setConfigPortalTimeout(180);   // give up after 3 min and run offline rather than block forever
+  wm.setBreakAfterConfig(true);
+  wm.setTitle(PRODUCT_NAME);        // portal heading (replaces the default "WiFiManager" brand)
+  static const char *portalMenu[] = {"wifi", "info", "sep", "restart", "exit"};
+  wm.setMenu(portalMenu, 5);        // adds a Restart button to the portal
+  // the page configures more than WiFi, so relabel the "Configure WiFi" button to just "Configure"
+  wm.setCustomHeadElement(
+    "<script>addEventListener('load',function(){var b=document.querySelector(\"form[action='/wifi'] button\");if(b)b.textContent='Configure';});</script>");
+
+  Serial.printf("WiFiManager: %s\n", forcePortal ? "double-reset -> forcing setup portal" : "autoConnect");
+  if (forcePortal) wm.startConfigPortal(CFG_AP_NAME);
+  else             wm.autoConnect(CFG_AP_NAME);
+
+  // Wait for DHCP to actually assign an address before reporting (avoids printing/using 0.0.0.0).
+  for (int i = 0; i < 20 && WiFi.status() == WL_CONNECTED && WiFi.localIP() == IPAddress(0, 0, 0, 0); i++)
+    delay(250);
+
+  // Read back whatever the portal holds (edited values if shown, else the seeded defaults) and persist.
+  strncpy(cfgServer, p_server.getValue(), sizeof(cfgServer) - 1);
+  cfgPort = (uint16_t)atoi(p_port.getValue());
+  strncpy(cfgUser, p_user.getValue(), sizeof(cfgUser) - 1);
+  strncpy(cfgPass, p_pass.getValue(), sizeof(cfgPass) - 1);
+  gMeterId = strtoul(p_meter.getValue(), nullptr, 10);
+  prefs.putString("server", cfgServer); prefs.putUShort("port", cfgPort);
+  prefs.putString("user", cfgUser);     prefs.putString("pass", cfgPass);
+  prefs.putUInt("meter", gMeterId);
+
+  WiFi.setAutoReconnect(true);
+  if (WiFi.status() == WL_CONNECTED)
+    Serial.printf("WiFi %s  IP %s  meter=%u  mqtt=%s:%u\n", WiFi.SSID().c_str(),
+                  WiFi.localIP().toString().c_str(), (unsigned)gMeterId, cfgServer, cfgPort);
+  else
+    Serial.println("WiFi not connected — continuing RF/serial only");
 }
 
 static int noiseVal = 184;
@@ -322,6 +417,54 @@ void setup() {
     u8g2.sendBuffer();
   }
 
+  // Double-tap-RST detector (flag in NVS so it survives the EN-pin reset). A 2nd reset within
+  // DRD_WINDOW_MS leaves the flag armed -> this boot forces the WiFi/MQTT setup portal.
+  Preferences drd;
+  drd.begin("drd", false);
+  bool forcePortal = drd.getBool("armed", false);
+  if (forcePortal) {
+    drd.putBool("armed", false);               // consume the trigger
+    drd.end();
+    Serial.println("double-reset detected -> launching setup portal (skipping survey)");
+    if (oledPresent) {
+      u8g2.clearBuffer();
+      u8g2.setFont(u8g2_font_6x12_tf);
+      u8g2.drawStr(0, 11, PRODUCT_NAME);
+      u8g2.drawHLine(0, 14, 128);
+      u8g2.drawStr(0, 34, "Launching");
+      u8g2.drawStr(0, 50, "WiFi/MQTT setup...");
+      u8g2.sendBuffer();
+    }
+    runProvisioning(true);                      // open the captive portal NOW, before any radio work
+    Serial.println("setup portal closed -> restarting");
+    delay(300);
+    ESP.restart();                              // reboot into normal operation with the new config
+  } else {
+    drd.putBool("armed", true);                // arm; commits to flash immediately
+    drd.end();
+    if (oledPresent) {
+      u8g2.clearBuffer();
+      u8g2.setFont(u8g2_font_6x12_tf);
+      u8g2.drawStr(0, 11, PRODUCT_NAME);
+      u8g2.drawHLine(0, 14, 128);
+      u8g2.drawStr(0, 34, "Press RST again now");
+      u8g2.drawStr(0, 50, "= WiFi/MQTT setup");
+      u8g2.sendBuffer();
+    }
+    uint32_t w = millis();                      // hold the arm window so a 2nd tap can be caught
+    while (millis() - w < DRD_WINDOW_MS) delay(10);
+    drd.begin("drd", false);
+    drd.putBool("armed", false);                // disarm: window passed, a later lone reset won't trigger
+    drd.end();
+    if (oledPresent) {                          // restore the boot screen for the upcoming survey
+      u8g2.clearBuffer();
+      u8g2.setFont(u8g2_font_6x12_tf);
+      u8g2.drawStr(0, 26, PRODUCT_NAME);
+      u8g2.drawStr(0, 42, "scanning band...");
+      u8g2.sendBuffer();
+    }
+  }
+
   SPI.begin(5, 19, 27, 18);
   // RxBw WIDE (250kHz max): RSSI must track R900's 30us carrier-off gaps. 100kHz was too slow
   // (slow decay -> gaps missed -> mostly-1 bitstream). Wider = faster envelope (more noise, OK).
@@ -346,13 +489,10 @@ void setup() {
   Serial.printf("poll=%.3f us/sample  noise_val=%d (%.1f dBm)  trigVal=%d (%.1f dBm)\n",
                 (t1 - t0) / 4000.0, noiseVal, -noiseVal / 2.0, trigVal, -trigVal / 2.0);
 
-  // WiFi + MQTT last (async; keeps survey/noise timing clean). Non-blocking: RF runs regardless.
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WLAN_SSID, WLAN_PASS);
-  for (int i = 0; i < 30 && WiFi.status() != WL_CONNECTED; i++) delay(250);
-  if (WiFi.status() == WL_CONNECTED) Serial.printf("WiFi %s  IP %s\n", WLAN_SSID, WiFi.localIP().toString().c_str());
-  else Serial.println("WiFi not connected — continuing RF/serial only");
-  mqtt.setServer(AIO_SERVER, AIO_SERVERPORT);
+  // WiFi + MQTT last (keeps survey/noise timing clean). Captive-portal provisioning: connects with
+  // saved/seed creds, or opens the "R900-Reader-Setup" AP (double-tap RST to force it).
+  runProvisioning(forcePortal);
+  mqtt.setServer(cfgServer, cfgPort);
   mqtt.setBufferSize(640);
   mqtt.setKeepAlive(300);   // > worst-case idle gap (capture blocks up to the 240s re-survey) so LWT won't false-fire
   mqttEnsure();             // connect now -> publishes birth "online" + reader-online discovery at boot
@@ -457,7 +597,7 @@ void loop() {
                         fracs[fi], spb, ph, (unsigned)(millis() - t0));
           publishReading(r, mn);   // mn = strongest RSSI val in the burst
           lastAnyMs = millis();    // any decode -> RX-active indicator
-          if (r.id == MY_METER_ID) { myReading = r; myMs = millis(); haveMy = true; }
+          if (gMeterId && r.id == gMeterId) { myReading = r; myMs = millis(); haveMy = true; }
           drawDisplay();
         }
       }

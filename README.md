@@ -29,6 +29,7 @@ A continuous interferer once sat on the meter's band during development, which l
 - **Availability** via MQTT Last-Will + a 5-min retained heartbeat → a `connectivity` binary sensor and `unavailable` entities when the board drops.
 - **OLED status display** — WiFi / MQTT / RX indicators, your meter number, leak duration, leak-now (None / Intermittent / Continuous), and a live "updated N s ago" counter.
 - **Self-calibrating channel survey** — portable; re-surveys if the channel goes quiet.
+- **Captive-portal provisioning** — set WiFi + MQTT + meter id from your phone, no reflash (**double-tap RST** to reconfigure). Compile-time `secrets.h` defaults are optional.
 - **Desktop tooling** (`experiments/`) for capturing and validating the decode pipeline against `rtl_433`.
 
 > ⚠️ **Single-channel by nature.** The SX1276 has a 250 kHz max bandwidth and no I/Q, so this watches one ~250 kHz window and catches the meter as it hops by (typically every few minutes). For full broadband, multi-protocol coverage, use an RTL-SDR with [rtlamr](https://github.com/bemasher/rtlamr) / [rtlamr2mqtt](https://github.com/allangood/rtlamr2mqtt). This board is the cheap, low-power, single-meter appliance.
@@ -51,19 +52,26 @@ A continuous interferer once sat on the meter's band during development, which l
 - This repo: `git clone https://github.com/<you>/lora32-r900-receiver && cd lora32-r900-receiver`
 
 ### 2. Configure secrets
+The build needs `src/secrets.h` to exist, so copy the template:
 ```bash
 cp src/secrets.h.example src/secrets.h
 ```
-Edit `src/secrets.h` with your WiFi, MQTT broker, and (optionally) your meter id:
-```c
-#define WLAN_SSID       "your-wifi"
-#define WLAN_PASS       "your-password"
-#define AIO_SERVER      "192.168.1.80"   // MQTT broker IP/host
-#define AIO_SERVERPORT  1883
-#define AIO_USERNAME    "mqttuser"
-#define AIO_KEY         "mqttpassword"
-#define MY_METER_ID     0u               // your R900 meter id (printed on the meter); 0 = unknown
-```
+You have **two ways** to provide WiFi/MQTT/meter settings:
+
+- **Captive portal (recommended, no reflash):** leave `secrets.h` blank. On first boot (or whenever
+  you **double-tap the RST button** — press it once, then again within ~3 s while the OLED shows
+  "Press RST again now") the board hosts a WiFi access point named **`R900-Reader-Setup`**. Join it
+  with your phone, the config page opens (or browse to `192.168.4.1`), and enter WiFi SSID/password
+  plus MQTT host/port/user/password and meter id. The values are saved to flash and used from then
+  on; the board reboots into normal operation. The OLED shows the setup instructions while the
+  portal is open.
+
+  *(Why double-tap RST and not a BOOT button? The older micro-USB LoRa32 boards (T3 v1.6.x) have no
+  BOOT button. The double-tap flag is stored in flash, since the RST button drives the EN pin — a
+  full hardware reset that wipes RTC memory.)*
+- **Compile-time defaults:** fill the values into `secrets.h` and they'll be used on first boot
+  without the portal. Handy if you're flashing many boards.
+
 `secrets.h` is gitignored — your credentials never get committed.
 
 ### 3. Set the serial port
@@ -130,6 +138,7 @@ This project stands on a lot of prior work:
 - **[RadioLib](https://github.com/jgromes/RadioLib)** by Jan Gromeš (MIT) — SX1276 driver / low-level register access.
 - **[PubSubClient](https://github.com/knolleary/pubsubclient)** by Nick O'Leary (MIT) — MQTT client.
 - **[U8g2](https://github.com/olikraus/u8g2)** by Oliver Kraus (BSD-2-Clause) — OLED graphics.
+- **[WiFiManager](https://github.com/tzapu/WiFiManager)** by tzapu (MIT) — captive-portal WiFi/MQTT provisioning.
 - **[Home Assistant](https://www.home-assistant.io/)** — MQTT discovery conventions.
 - **[PlatformIO](https://platformio.org/)** + **[arduino-esp32](https://github.com/espressif/arduino-esp32)** — build & runtime.
 
