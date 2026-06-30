@@ -32,6 +32,7 @@
 #include <PubSubClient.h>
 #include <U8g2lib.h>     // SSD1306 OLED (LoRa32 V2.1.6: I2C SDA=21 SCL=22 RST=16)
 #include <Wire.h>
+#include <Ticker.h>      // background flashing of the leak LED (independent of the capture loop)
 #include "secrets.h"     // optional compile-time DEFAULTS; the captive portal overrides these at runtime
 
 // ttgo-lora32-v21 SX1276 pins: NSS=18 DIO0=26 RST=23 DIO1=33 ; SPI SCK=5 MISO=19 MOSI=27
@@ -121,13 +122,39 @@ static uint32_t     lastBeat = 0;                       // last heartbeat publis
 // armed, and the next boot reads it set -> force portal.
 #define PRODUCT_NAME  "R900 Reader"      // shown on the OLED + as the captive-portal heading
 #define CFG_AP_NAME   "R900-Reader-Setup"
-#define DRD_WINDOW_MS 3000               // double-tap window
+#define DRD_WINDOW_MS 5000               // double-tap window (time to press RST again for setup)
 static Preferences  prefs;
 static char         cfgServer[40];       // MQTT broker host/IP
 static uint16_t     cfgPort = 1883;      // MQTT port
 static char         cfgUser[32];         // MQTT username
 static char         cfgPass[48];         // MQTT password
 static uint32_t     gMeterId = 0;        // the meter the OLED tracks (0 = none/any)
+static bool         diagEnabled = false; // publish diagnostic sensors to MQTT (toggle in the portal, NVS)
+static uint32_t     lastDiag = 0;        // last diagnostic publish (ms)
+#define DIAG_TOPIC  "lora32r900/diag/state"
+
+// HA diagnostic sensors (watched freq / last-known-good / seconds since last decode). Published only
+// when diagEnabled; passing en=false sends empty retained configs to REMOVE them from HA.
+static void publishDiagDiscovery(bool en) {
+  struct { const char *obj, *name, *tpl, *unit; } d[] = {
+    {"watch_freq",   "Watch Frequency",        "{{ value_json.freq }}",    "MHz"},
+    {"good_freq",    "Last-Known-Good Freq",   "{{ value_json.good }}",    "MHz"},
+    {"since_decode", "Since Last Decode",      "{{ value_json.since_s }}", "s"},
+  };
+  char t[96], p[420];
+  for (auto &x : d) {
+    snprintf(t, sizeof(t), "homeassistant/sensor/lora32r900_%s/config", x.obj);
+    if (en) {
+      snprintf(p, sizeof(p),
+        "{\"name\":\"%s\",\"uniq_id\":\"lora32r900_%s\",\"stat_t\":\"" DIAG_TOPIC "\",\"avty_t\":\"" AVAIL_TOPIC "\","
+        "\"ent_cat\":\"diagnostic\",\"unit_of_meas\":\"%s\",\"val_tpl\":\"%s\","
+        "\"dev\":{\"ids\":[\"lora32r900_reader\"]}}", x.name, x.obj, x.unit, x.tpl);
+      mqtt.publish(t, p, true);
+    } else {
+      mqtt.publish(t, "", true);            // empty retained payload removes the entity from HA
+    }
+  }
+}
 
 // HA connectivity binary_sensor for the board itself (fed by LWT/birth/heartbeat on AVAIL_TOPIC).
 static void publishReaderDiscovery() {
@@ -147,6 +174,7 @@ static void mqttEnsure() {
     mqtt.publish(AVAIL_TOPIC, "online", true);   // birth (retained, overwrites the previous value)
     lastBeat = millis();
     publishReaderDiscovery();
+    publishDiagDiscovery(diagEnabled);           // create or remove the diagnostic sensors per the toggle
   }
 }
 
@@ -205,6 +233,24 @@ static bool     haveMy   = false;
 static uint32_t myMs     = 0;         // millis() of MY_METER_ID's last decode
 static uint32_t lastAnyMs = 0;        // millis() of ANY meter's last decode (RX-active indicator)
 
+// ---- watched frequency + auto-hop fallback ----
+#define DECODE_TIMEOUT_MS 2700000UL   // 45 min with no decode -> hop to a different frequency (adjustable)
+static float    watchFreq = 916.300f; // currently parked frequency (shown in the OLED header)
+static float    goodFreq  = 0;        // last frequency that produced a decode (persisted in NVS)
+static uint32_t lastDecodeRef = 0;    // millis() baseline for the decode-timeout (reset on boot/decode/hop)
+
+// ---- leak LED (the board's one user LED, GPIO25; the red power LED is hardwired = power indicator) ----
+#define LEAK_LED_PIN  25              // LED_BUILTIN on this board (ttgo-lora32-v21new)
+static Ticker  leakTicker;
+static void    leakToggle() { static bool on = false; on = !on; digitalWrite(LEAK_LED_PIN, on); }
+// 0=none -> off, 1=intermittent -> slow flash, 2=continuous/now -> fast flash
+static void    setLeakLed(int leaknow) {
+  leakTicker.detach();
+  if      (leaknow == 1) leakTicker.attach_ms(1500, leakToggle);  // slow flash (1.5s) = intermittent leak
+  else if (leaknow == 2) leakTicker.attach_ms(500, leakToggle);   // fast flash (0.5s) = definite leak now
+  else                   digitalWrite(LEAK_LED_PIN, LOW);         // no leak -> off
+}
+
 static const char *leakText(int l) {
   static const char *t[] = {"none", "1-2 days", "3-7 days", "8-14 days", "15-21 days", "22-34 days", "35+ days"};
   return (l >= 0 && l <= 6) ? t[l] : "?";
@@ -236,17 +282,25 @@ static void drawDisplay() {
   bool mq   = mqtt.connected();
   bool rx   = (lastAnyMs != 0) && (millis() - lastAnyMs < RX_ACTIVE_MS);
   u8g2.clearBuffer();
-  // top status bar: WiFi icon + MQTT + RX flags
+  // top status bar: WiFi icon + MQTT + RX flags + watched frequency (right-aligned)
   drawWifi(0, wifi);
-  drawFlag(20, "MQTT", mq);
-  drawFlag(78, "RX", rx);
+  drawFlag(18, "MQTT", mq);
+  drawFlag(52, "RX", rx);
+  char fb[10]; snprintf(fb, sizeof(fb), "%.2f", watchFreq);   // e.g. 916.25
+  u8g2.setFont(u8g2_font_5x7_tf);
+  u8g2.drawStr(128 - (int)strlen(fb) * 5, 9, fb);
   u8g2.drawHLine(0, 13, 128);
   // body
   u8g2.setFont(u8g2_font_6x12_tf);
   if (!haveMy) {
-    u8g2.drawStr(0, 30, "Waiting for meter");
+    u8g2.drawStr(0, 27, "Waiting for meter");
     char m[24]; snprintf(m, sizeof(m), gMeterId ? "%u ..." : "(any)", (unsigned)gMeterId);
-    u8g2.drawStr(0, 44, m);
+    u8g2.drawStr(0, 41, m);
+    uint32_t el = millis() - lastDecodeRef;                       // countdown to the channel-hop timeout
+    uint32_t rem = (DECODE_TIMEOUT_MS > el) ? (DECODE_TIMEOUT_MS - el) / 1000 : 0;
+    char c[26]; snprintf(c, sizeof(c), "New chan in %lu:%02lu",
+                         (unsigned long)(rem / 60), (unsigned long)(rem % 60));
+    u8g2.drawStr(0, 58, c);
   } else {
     char l[24];
     snprintf(l, sizeof(l), "Meter %u", (unsigned)myReading.id);   u8g2.drawStr(0, 26, l);
@@ -282,6 +336,7 @@ static void runProvisioning(bool forcePortal) {
   prefs.getString("user", AIO_USERNAME).toCharArray(cfgUser, sizeof(cfgUser));
   prefs.getString("pass", AIO_KEY).toCharArray(cfgPass, sizeof(cfgPass));
   gMeterId = prefs.getUInt("meter", MY_METER_ID);
+  diagEnabled = prefs.getBool("diag", false);
 
   // If WiFi was never stored but secrets.h provides creds, connect with them first (no portal needed).
   // Wait for a full connection (WL_CONNECTED implies DHCP done on ESP32) so we don't race autoConnect.
@@ -292,14 +347,16 @@ static void runProvisioning(bool forcePortal) {
 
   char portBuf[8]; snprintf(portBuf, sizeof(portBuf), "%u", cfgPort);
   char meterBuf[12]; snprintf(meterBuf, sizeof(meterBuf), "%u", (unsigned)gMeterId);
+  char diagBuf[2]; snprintf(diagBuf, sizeof(diagBuf), "%d", diagEnabled ? 1 : 0);
   WiFiManager wm;
-  WiFiManagerParameter p_server("server", "MQTT server (IP/host)", cfgServer, sizeof(cfgServer) - 1);
-  WiFiManagerParameter p_port  ("port",   "MQTT port",            portBuf,   sizeof(portBuf) - 1);
-  WiFiManagerParameter p_user  ("user",   "MQTT username",        cfgUser,   sizeof(cfgUser) - 1);
-  WiFiManagerParameter p_pass  ("pass",   "MQTT password",        cfgPass,   sizeof(cfgPass) - 1);
-  WiFiManagerParameter p_meter ("meter",  "Meter ID (0 = any)",   meterBuf,  sizeof(meterBuf) - 1);
+  WiFiManagerParameter p_server("server", "MQTT server (IP/host)",      cfgServer, sizeof(cfgServer) - 1);
+  WiFiManagerParameter p_port  ("port",   "MQTT port",                  portBuf,   sizeof(portBuf) - 1);
+  WiFiManagerParameter p_user  ("user",   "MQTT username",              cfgUser,   sizeof(cfgUser) - 1);
+  WiFiManagerParameter p_pass  ("pass",   "MQTT password",              cfgPass,   sizeof(cfgPass) - 1);
+  WiFiManagerParameter p_meter ("meter",  "Meter ID (0 = any)",         meterBuf,  sizeof(meterBuf) - 1);
+  WiFiManagerParameter p_diag  ("diag",   "Diagnostics to MQTT (1/0)",  diagBuf,   1);
   wm.addParameter(&p_server); wm.addParameter(&p_port); wm.addParameter(&p_user);
-  wm.addParameter(&p_pass);   wm.addParameter(&p_meter);
+  wm.addParameter(&p_pass);   wm.addParameter(&p_meter);  wm.addParameter(&p_diag);
   wm.setAPCallback(portalOnOLED);
   wm.setConfigPortalTimeout(180);   // give up after 3 min and run offline rather than block forever
   wm.setBreakAfterConfig(true);
@@ -324,9 +381,10 @@ static void runProvisioning(bool forcePortal) {
   strncpy(cfgUser, p_user.getValue(), sizeof(cfgUser) - 1);
   strncpy(cfgPass, p_pass.getValue(), sizeof(cfgPass) - 1);
   gMeterId = strtoul(p_meter.getValue(), nullptr, 10);
+  diagEnabled = (atoi(p_diag.getValue()) != 0);
   prefs.putString("server", cfgServer); prefs.putUShort("port", cfgPort);
   prefs.putString("user", cfgUser);     prefs.putString("pass", cfgPass);
-  prefs.putUInt("meter", gMeterId);
+  prefs.putUInt("meter", gMeterId);     prefs.putBool("diag", diagEnabled);
 
   WiFi.setAutoReconnect(true);
   if (WiFi.status() == WL_CONNECTED)
@@ -366,7 +424,7 @@ static inline int readRssi() { // single read with its own transaction (trigger/
 #define SCAN_HI    920.0f
 #define SCAN_STEP  0.25f     // MHz ~ one RxBw window
 #define SCAN_DWELL 400       // ms per channel
-static float watchFreq = 916.300f;
+#define PREF_FREQ  916.0f    // when the band is uniformly clean, bias toward this (R900 hop-set sweet spot)
 
 static void retune(float f) { radio.standby(); radio.setFrequency(f); radio.setOOK(true); radio.receiveDirect(); delayMicroseconds(800); }
 
@@ -384,8 +442,10 @@ static void surveyChannels() {
     int dutyPM = (int)(below * 1000ULL / tot);                         // per-mille active
     Serial.printf("  %.3f MHz  noise=%d(%.0fdBm)  duty=%d.%d%%  %s\n",
                   f, nf, -nf / 2.0, dutyPM / 10, dutyPM % 10, dutyPM > 200 ? "<-- carrier/interferer" : "");
-    // lowest duty wins; tie-break on the quietest floor (higher RSSI val = lower power)
-    if (dutyPM < bestDuty - 5 || (abs(dutyPM - bestDuty) <= 5 && nf > bestNoise)) {
+    // lowest duty wins; on a tie prefer the window nearest PREF_FREQ (the meter's productive region,
+    // so a uniformly-clean band parks near 916 MHz rather than the arbitrary band edge)
+    if (dutyPM < bestDuty - 5 ||
+        (abs(dutyPM - bestDuty) <= 5 && fabsf(f - PREF_FREQ) < fabsf(best - PREF_FREQ))) {
       bestDuty = dutyPM; bestNoise = nf; best = f;
     }
   }
@@ -394,11 +454,63 @@ static void surveyChannels() {
   retune(watchFreq);
 }
 
+// measure the noise floor on the current channel and set the burst trigger threshold
+static void measureNoise() {
+  SPI.beginTransaction(spiSet);
+  long acc = 0;
+  for (int i = 0; i < 4000; i++) acc += fastRssi();
+  SPI.endTransaction();
+  noiseVal = acc / 4000;
+  trigVal  = noiseVal - 30;            // ~15 dB above floor (lower val = stronger) — strong bursts only
+  Serial.printf("noise_val=%d (%.1f dBm)  trigVal=%d (%.1f dBm)  on %.3f MHz\n",
+                noiseVal, -noiseVal / 2.0, trigVal, -trigVal / 2.0, watchFreq);
+}
+
+// remember the frequency that just decoded a meter (persist to NVS for the next boot)
+static void saveGoodFreq(float f) {
+  if (f == goodFreq) return;
+  goodFreq = f;
+  Preferences p; p.begin("r900", false); p.putFloat("goodfreq", f); p.end();
+  Serial.printf("saved last-known-good frequency %.3f MHz\n", f);
+}
+
+// decode-timeout fallback: step to the next band window, skipping obvious interferers
+static void hopToNextFreq() {
+  const int windows = (int)((SCAN_HI - SCAN_LO) / SCAN_STEP) + 1;
+  float f = watchFreq;
+  for (int tries = 0; tries < windows; tries++) {
+    f += SCAN_STEP; if (f > SCAN_HI + 0.001f) f = SCAN_LO;
+    retune(f);
+    SPI.beginTransaction(spiSet);
+    long acc = 0; for (int i = 0; i < 1000; i++) acc += fastRssi();
+    int nf = acc / 1000, trig = nf - 30;
+    uint32_t below = 0, tot = 0, t0 = millis();
+    while (millis() - t0 < 200) { if (fastRssi() < trig) below++; tot++; }
+    SPI.endTransaction();
+    if ((int)(below * 1000ULL / tot) <= 200) break;    // clean enough (<=20% duty) — park here
+  }
+  watchFreq = f;
+  retune(watchFreq);
+  measureNoise();
+  lastDecodeRef = millis();
+  Serial.printf("=> hopped to %.3f MHz (decode-timeout fallback)\n", watchFreq);
+}
+
+// publish the diagnostic JSON (watched freq, last-known-good, seconds since last decode)
+static void publishDiag() {
+  if (!diagEnabled || !mqtt.connected()) return;
+  char p[160];
+  snprintf(p, sizeof(p), "{\"freq\":%.3f,\"good\":%.3f,\"since_s\":%lu}",
+           watchFreq, goodFreq, (unsigned long)((millis() - lastDecodeRef) / 1000));
+  mqtt.publish(DIAG_TOPIC, p, true);
+}
+
 void setup() {
   Serial.begin(115200);
   delay(800);
   Serial.println();
   Serial.println("=== OPTIONB RSSI-envelope capture de-risk ===");
+  pinMode(LEAK_LED_PIN, OUTPUT); digitalWrite(LEAK_LED_PIN, LOW);   // leak LED off until we have a reading
 
   // OLED is OPTIONAL — probe at 0x3C first with a short timeout so a missing/mis-wired panel
   // can't stall the I2C bus and watchdog-reset the boot (root cause of the earlier boot loop).
@@ -475,19 +587,19 @@ void setup() {
   st = radio.receiveDirect();
   Serial.printf("receiveDirect=%d\n", st);
 
+  { Preferences p; p.begin("r900", true); goodFreq = p.getFloat("goodfreq", 0.0f); p.end(); }
+
   surveyChannels();   // self-calibrate: pick the cleanest window in the R900 band (portable to any site)
 
-  // measure poll rate + noise floor on the CHOSEN channel (the tight-loop path, one transaction)
-  SPI.beginTransaction(spiSet);
-  uint32_t t0 = micros();
-  long acc = 0;
-  for (int i = 0; i < 4000; i++) acc += fastRssi();
-  uint32_t t1 = micros();
-  SPI.endTransaction();
-  noiseVal = acc / 4000;
-  trigVal  = noiseVal - 30;             // ~15 dB above floor (lower val = stronger) — strong bursts only
-  Serial.printf("poll=%.3f us/sample  noise_val=%d (%.1f dBm)  trigVal=%d (%.1f dBm)\n",
-                (t1 - t0) / 4000.0, noiseVal, -noiseVal / 2.0, trigVal, -trigVal / 2.0);
+  // prefer the last frequency that actually decoded a meter, if we have one (faster reacquisition)
+  if (goodFreq >= SCAN_LO && goodFreq <= SCAN_HI) {
+    watchFreq = goodFreq;
+    retune(watchFreq);
+    Serial.printf("=> parking on last-known-good %.3f MHz\n", watchFreq);
+  }
+
+  measureNoise();                  // noise floor + trigger threshold on the chosen channel
+  lastDecodeRef = millis();        // start the decode-timeout clock
 
   // WiFi + MQTT last (keeps survey/noise timing clean). Captive-portal provisioning: connects with
   // saved/seed creds, or opens the "R900-Reader-Setup" AP (double-tap RST to force it).
@@ -503,16 +615,21 @@ void setup() {
 
 #define PRE 700   // samples kept BEFORE the trigger (~2.7ms) so the preamble onset is captured
 
-void loop() {
+static void serviceMqtt() {
   mqttEnsure();                        // connect/maintain (publishes birth + reader discovery on connect)
   if (mqtt.connected()) {
-    mqtt.loop();                       // services keepalive PINGs; called each loop (<= ~243s apart < keepalive)
-    if (millis() - lastBeat > 300000) { mqtt.publish(AVAIL_TOPIC, "online", true); lastBeat = millis(); }  // 5-min heartbeat (retained)
+    mqtt.loop();                       // services keepalive PINGs
+    if (millis() - lastBeat > 300000) { mqtt.publish(AVAIL_TOPIC, "online", true); lastBeat = millis(); }  // 5-min heartbeat
+    if (diagEnabled && millis() - lastDiag > 30000) { publishDiag(); lastDiag = millis(); }                // 30s diagnostics
   }
+}
 
-  // Continuous ring-buffer fill with uniform per-sample work (read + compare), so the
-  // pre-trigger preamble is captured at the same dt as the rest. Trigger = 5 consecutive
-  // strong samples. After trigger, keep filling until PRE samples precede + the rest follow.
+// Capture one burst on the current channel and try to decode it. Pure capture + DSP + decode; the
+// caller decides what to do with the result (publish / hop / tally). Returns:
+//   -1 = idle (no trigger within maxIdleMs)   0 = burst seen, no valid decode   1 = decoded (fills *r)
+static int captureOnce(R900 *r, int *rssiOut, uint32_t maxIdleMs) {
+  // Continuous ring-buffer fill with uniform per-sample work, so the pre-trigger preamble is
+  // captured at the same dt as the rest. Trigger = 5 consecutive strong samples.
   uint32_t n = 0; long trigN = -1; int consec = 0; uint32_t tTrig = 0, tEnd = 0;
   uint32_t waitStart = millis();
   SPI.beginTransaction(spiSet);
@@ -522,14 +639,7 @@ void loop() {
     if (trigN < 0) {
       if (v < trigVal) { if (++consec >= 5) { trigN = n; tTrig = micros(); } }
       else consec = 0;
-      // window gone quiet (dead or env changed) — bail out and re-survey
-      if ((n & 0x3FFFF) == 0 && millis() - waitStart > 240000) { SPI.endTransaction();
-        Serial.println("channel quiet 4min — re-surveying"); surveyChannels(); return; }
-      // refresh OLED ~1/s while idle (consec==0 -> no burst forming; I2C is off the radio SPI bus)
-      if (consec == 0 && (n & 0x1FFF) == 0) {
-        static uint32_t lastDraw = 0;
-        if (millis() - lastDraw > 1000) { drawDisplay(); lastDraw = millis(); }
-      }
+      if ((n & 0x3FFFF) == 0 && millis() - waitStart > maxIdleMs) { SPI.endTransaction(); return -1; }
     } else if ((long)n - trigN >= CAP_N - PRE) { tEnd = micros(); break; }
     n++;
   }
@@ -545,10 +655,11 @@ void loop() {
     lin[k] = x;
     if (x < mn) mn = x; if (x < trigVal) above++;
   }
+  *rssiOut = mn;
   bool r900like = (above >= 700 && above <= 9000);     // bursty packet, not a continuous carrier
   Serial.printf("BURST dt=%.3fus/sample N=%d min=%d(%.1fdBm) samples_in_burst=%d %s\n",
                 dt, CAP_N, mn, -mn / 2.0, above, r900like ? "R900LIKE" : "skip-continuous");
-  if (!r900like) { delay(800); return; }
+  if (!r900like) return 0;
 
 #ifdef DUMP_RAW
   for (long k = 0; k < CAP_N; k++) sprintf(hexbuf + k * 2, "%02x", lin[k]);
@@ -571,7 +682,7 @@ void loop() {
   int globMid = (mn + noise) / 2;
   long lo = -1, hi = -1;
   for (long k = 0; k < CAP_N; k++) if (lin[k] < globMid) { if (lo < 0) lo = k; hi = k; }
-  if (lo < 0) { delay(800); return; }
+  if (lo < 0) return 0;
   int rmn = 255, rhist[256]; memset(rhist, 0, sizeof(rhist));
   for (long k = lo; k <= hi; k++) { if (lin[k] < rmn) rmn = lin[k]; rhist[lin[k]]++; }
   int racc = 0, roff = noise, rcount = hi - lo + 1;
@@ -581,29 +692,88 @@ void loop() {
   float spb0 = BIT_US / dt;
   static const float fracs[] = {0.30f, 0.40f, 0.45f, 0.50f, 0.55f, 0.60f, 0.70f};
   static const float muls[]  = {0.98f, 0.99f, 1.0f, 1.01f, 1.02f};
-  R900 r; bool got = false;
   uint32_t t0 = millis();
-  for (unsigned fi = 0; fi < 7 && !got; fi++) {
+  for (unsigned fi = 0; fi < 7; fi++) {
     int thresh = rmn + (int)(fracs[fi] * (roff - rmn));
-    for (unsigned mi = 0; mi < 5 && !got; mi++) {
+    for (unsigned mi = 0; mi < 5; mi++) {
       float spb = spb0 * muls[mi];
-      for (float ph = 0; ph <= 2 * spb && !got; ph += 0.5f) {
+      for (float ph = 0; ph <= 2 * spb; ph += 0.5f) {
         recover(thresh, spb, ph);
         if (gnbits < 240) continue;
-        if (r900_decode(&r)) { got = true;
+        if (r900_decode(r)) {
           Serial.printf("*** R900 DECODE  id=%u consumption=%u backflow=%d leak=%d leaknow=%d "
                         "(frac=%.2f spb=%.2f phase=%.1f) %ums ***\n",
-                        r.id, r.consumption, r.backflow, r.leak, r.leaknow,
+                        r->id, r->consumption, r->backflow, r->leak, r->leaknow,
                         fracs[fi], spb, ph, (unsigned)(millis() - t0));
-          publishReading(r, mn);   // mn = strongest RSSI val in the burst
-          lastAnyMs = millis();    // any decode -> RX-active indicator
-          if (gMeterId && r.id == gMeterId) { myReading = r; myMs = millis(); haveMy = true; }
-          drawDisplay();
+          return 1;
         }
       }
     }
   }
-  if (!got) Serial.printf("no decode (%ums sweep)\n", (unsigned)(millis() - t0));
-  delay(800);
+  Serial.printf("no decode (%ums sweep)\n", (unsigned)(millis() - t0));
+  return 0;
 }
+
+#ifdef FREQ_COVERAGE_TEST
+// ===== one-off coverage test: park each band window for COV_DWELL_MS, log every decode to serial =====
+// Build: pio run -e coverage -t upload. Capture serial to a file; analyse the COV-* lines in post.
+#define COV_DWELL_MS 1500000UL    // 25 min per window (>= ~2 R900 hop cycles)
+
+void loop() {
+  static bool announced = false;
+  if (!announced) {
+    Serial.printf("=== COVERAGE TEST: %.0f-%.0f MHz step %.2f, %.1f min/window, sweeps repeat ===\n",
+                  SCAN_LO, SCAN_HI, SCAN_STEP, COV_DWELL_MS / 60000.0);
+    announced = true;
+  }
+  for (float f = SCAN_LO; f <= SCAN_HI + 0.001f; f += SCAN_STEP) {
+    watchFreq = f;
+    retune(f);
+    measureNoise();
+    Serial.printf("COV-WIN-START f=%.3f noise=%d t=%lu\n", f, noiseVal, (unsigned long)millis());
+    int decodes = 0, bursts = 0;
+    uint32_t winStart = millis();
+    while (millis() - winStart < COV_DWELL_MS) {
+      serviceMqtt();
+      R900 r; int rssi;
+      int res = captureOnce(&r, &rssi, 5000);
+      if (res >= 0) bursts++;                 // a burst triggered (decoded or not)
+      if (res == 1) {
+        decodes++;
+        Serial.printf("COV-DEC f=%.3f id=%u cons=%u rssi=%d leak=%d leaknow=%d t=%lu\n",
+                      f, r.id, r.consumption, rssi, r.leak, r.leaknow, (unsigned long)millis());
+        publishReading(r, rssi);              // keep HA fed so the meter doesn't look offline mid-test
+      }
+    }
+    Serial.printf("COV-WIN-DONE f=%.3f decodes=%d bursts=%d noise=%d t=%lu\n",
+                  f, decodes, bursts, noiseVal, (unsigned long)millis());
+  }
+  Serial.printf("COV-SWEEP-DONE t=%lu — starting next pass\n", (unsigned long)millis());
+}
+
+#else
+void loop() {
+  serviceMqtt();
+  R900 r; int rssi;
+  int res = captureOnce(&r, &rssi, 3000);     // returns within ~3s if idle so MQTT/OLED stay serviced
+  if (res < 0) {                              // idle: refresh display, check the decode-timeout fallback
+    drawDisplay();
+    if (millis() - lastDecodeRef > DECODE_TIMEOUT_MS) {
+      Serial.printf("no decode for %lu min — hopping frequency\n", DECODE_TIMEOUT_MS / 60000);
+      hopToNextFreq();
+    }
+    return;
+  }
+  if (res == 1) {
+    publishReading(r, rssi);                  // rssi = strongest RSSI val in the burst
+    lastAnyMs = millis();                     // any decode -> RX-active indicator
+    lastDecodeRef = millis();                 // reset the decode-timeout clock
+    saveGoodFreq(watchFreq);                  // this frequency works -> remember it for next boot
+    if (gMeterId && r.id == gMeterId) { myReading = r; myMs = millis(); haveMy = true; setLeakLed(r.leaknow); }
+    drawDisplay();
+  } else {
+    delay(800);                               // burst seen but no decode -> brief backoff
+  }
+}
+#endif
 #endif

@@ -27,9 +27,11 @@ A continuous interferer once sat on the meter's band during development, which l
 - **Standalone decode** on the ESP32 (~100 ms/burst), no PC or SDR in the loop.
 - **Home Assistant MQTT discovery** — each meter appears as its own device (`Neptune R900 (LoRa32) <id>`) with `Consumption` (gal, `total_increasing`), `Leak Now`, and `RSSI` sensors. Consumption is divided by 10 (R900 reports tenths of a gallon).
 - **Availability** via MQTT Last-Will + a 5-min retained heartbeat → a `connectivity` binary sensor and `unavailable` entities when the board drops.
-- **OLED status display** — WiFi / MQTT / RX indicators, your meter number, leak duration, leak-now (None / Intermittent / Continuous), and a live "updated N s ago" counter.
-- **Self-calibrating channel survey** — portable; re-surveys if the channel goes quiet.
+- **OLED status display** — WiFi / MQTT / RX indicators and the **watched frequency** in the header bar; your meter number, leak duration, leak-now (None / Intermittent / Continuous), a live "updated N s ago" counter, and a **countdown** to the next channel hop while waiting.
+- **Leak LED** — the onboard user LED (GPIO25) flashes **slowly (1.5 s)** for an intermittent leak and **fast (0.5 s)** for a definite leak-now; off when clear. The hardwired red LED is the power indicator.
+- **Self-calibrating channel survey + auto-hop** — portable; parks on the cleanest window, remembers the last good frequency in NVS, and hops to a new channel if it stops hearing the meter.
 - **Captive-portal provisioning** — set WiFi + MQTT + meter id from your phone, no reflash (**double-tap RST** to reconfigure). Compile-time `secrets.h` defaults are optional.
+- **Optional MQTT diagnostics** — a toggle (portal field "Diagnostics to MQTT", persisted in NVS, **off by default**) publishes `entity_category: diagnostic` sensors for watched frequency, last-known-good frequency, and seconds-since-last-decode.
 - **Desktop tooling** (`experiments/`) for capturing and validating the decode pipeline against `rtl_433`.
 
 > ⚠️ **Single-channel by nature.** The SX1276 has a 250 kHz max bandwidth and no I/Q, so this watches one ~250 kHz window and catches the meter as it hops by (typically every few minutes). For full broadband, multi-protocol coverage, use an RTL-SDR with [rtlamr](https://github.com/bemasher/rtlamr) / [rtlamr2mqtt](https://github.com/allangood/rtlamr2mqtt). This board is the cheap, low-power, single-meter appliance.
@@ -59,7 +61,7 @@ cp src/secrets.h.example src/secrets.h
 You have **two ways** to provide WiFi/MQTT/meter settings:
 
 - **Captive portal (recommended, no reflash):** leave `secrets.h` blank. On first boot (or whenever
-  you **double-tap the RST button** — press it once, then again within ~3 s while the OLED shows
+  you **double-tap the RST button** — press it once, then again within ~5 s while the OLED shows
   "Press RST again now") the board hosts a WiFi access point named **`R900-Reader-Setup`**. Join it
   with your phone, the config page opens (or browse to `192.168.4.1`), and enter WiFi SSID/password
   plus MQTT host/port/user/password and meter id. The values are saved to flash and used from then
@@ -103,8 +105,10 @@ Most behavior is tunable via `#define`s near the top of `src/main_optionb.cpp`:
 | `SCAN_LO` / `SCAN_HI` / `SCAN_STEP` | 911 / 920 / 0.25 MHz | Channel-survey band & step |
 | `PRE` | 700 | Pre-trigger samples kept (captures the preamble onset) |
 | `RX_ACTIVE_MS` | 600000 | OLED "RX" indicator window (any decode within N ms) |
-| `MY_METER_ID` | from `secrets.h` | Meter tracked on the OLED |
-| MQTT topics | `lora32r900/<id>/state`, `lora32r900/availability` | retained |
+| `DECODE_TIMEOUT_MS` | 2700000 | No-decode time before auto-hopping to a new channel (45 min) |
+| `MY_METER_ID` | from `secrets.h` | Meter tracked on the OLED / leak LED |
+| Diagnostics to MQTT | off | Runtime toggle in the portal (NVS); diagnostic freq/decode-age sensors |
+| MQTT topics | `lora32r900/<id>/state`, `lora32r900/availability`, `lora32r900/diag/state` | retained |
 
 The duty filter in `loop()` (`above >= 700 && above <= 9000`) rejects continuous-carrier interferers; widen if your packets differ.
 
