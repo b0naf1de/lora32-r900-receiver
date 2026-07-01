@@ -11,5 +11,8 @@ src/secrets.h
 # Captured RF data / experiment runs (may contain neighbours' meter readings)
 experiments/results/
 
+# UI prototypes + captured portal screenshots (contain real SSIDs/creds/meter ids — keep local only)
+experiments/ui/
+
 # OS
 .DS_Store

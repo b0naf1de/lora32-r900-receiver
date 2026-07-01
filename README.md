@@ -105,7 +105,7 @@ Most behavior is tunable via `#define`s near the top of `src/main_optionb.cpp`:
 | `SCAN_LO` / `SCAN_HI` / `SCAN_STEP` | 911 / 920 / 0.25 MHz | Channel-survey band & step |
 | `PRE` | 700 | Pre-trigger samples kept (captures the preamble onset) |
 | `RX_ACTIVE_MS` | 600000 | OLED "RX" indicator window (any decode within N ms) |
-| `DECODE_TIMEOUT_MS` | 2700000 | No-decode time before auto-hopping to a new channel (45 min) |
+| `DECODE_TIMEOUT_MS` | 900000 | No-decode time before auto-hopping to a new channel (15 min) |
 | `MY_METER_ID` | from `secrets.h` | Meter tracked on the OLED / leak LED |
 | Diagnostics to MQTT | off | Runtime toggle in the portal (NVS); diagnostic freq/decode-age sensors |
 | MQTT topics | `lora32r900/<id>/state`, `lora32r900/availability`, `lora32r900/diag/state` | retained |
