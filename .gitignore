@@ -1,4 +1,4 @@
-# Secrets — WiFi/MQTT credentials + meter id (copy secrets.h.example -> secrets.h)
+# Local dev credentials, if any (the firmware needs no secrets file — all config is runtime via the portal)
 src/secrets.h
 
 # PlatformIO build output + downloaded libraries
