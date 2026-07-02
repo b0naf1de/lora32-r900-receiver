@@ -112,9 +112,11 @@ static bool r900_decode(R900 *out) {
 static char cfgTopic[24] = "r900_meter";   // MQTT base topic (configurable in the portal, persisted NVS)
 static char availTopic[40];                // "<cfgTopic>/availability" — built at runtime by buildTopics()
 static char diagTopic[40];                 // "<cfgTopic>/diag/state"
+static char battTopic[40];                 // "<cfgTopic>/batt/state"
 static void buildTopics() {
   snprintf(availTopic, sizeof(availTopic), "%s/availability", cfgTopic);
   snprintf(diagTopic,  sizeof(diagTopic),  "%s/diag/state",   cfgTopic);
+  snprintf(battTopic,  sizeof(battTopic),  "%s/batt/state",   cfgTopic);
 }
 static WiFiClient   espClient;
 static PubSubClient mqtt(espClient);
@@ -155,6 +157,10 @@ static void meterLabel(uint32_t id, char *buf, size_t n) {
 }
 static bool         diagEnabled = false; // publish diagnostic sensors to MQTT (toggle in the portal, NVS)
 static uint32_t     lastDiag = 0;        // last diagnostic publish (ms)
+static uint32_t     lastBatt = 0;        // last battery publish (ms)
+#define BATT_MS     300000UL             // publish battery every 5 min
+#define BATT_PIN    35                   // LilyGO LoRa32 V2.1.6: VBAT/2 via 100K/100K divider on GPIO35
+static void publishBatt();               // forward decl (defined below publishDiag)
 
 // HA diagnostic sensors (watched freq / last-known-good / seconds since last decode). Published only
 // when diagEnabled; passing en=false sends empty retained configs to REMOVE them from HA.
@@ -179,6 +185,27 @@ static void publishDiagDiscovery(bool en) {
   }
 }
 
+static void publishBattDiscovery() {
+  char t[80], p[420];
+  struct { const char *obj, *name, *dev_cla, *unit, *icon, *tpl; } d[] = {
+    {"battery",     "Battery",      "battery",    "%",  nullptr,             "{{ value_json.pct | round(0) }}"},
+    {"power_source","Power Source", nullptr,      nullptr, "mdi:power-plug", "{{ value_json.src }}"},
+  };
+  for (auto &x : d) {
+    snprintf(t, sizeof(t), "homeassistant/sensor/lora32r900_%s/config", x.obj);
+    char dca[32] = "", unt[32] = "", ico[40] = "";
+    if (x.dev_cla) snprintf(dca, sizeof(dca), "\"dev_cla\":\"%s\",", x.dev_cla);
+    if (x.unit)    snprintf(unt, sizeof(unt), "\"unit_of_meas\":\"%s\",", x.unit);
+    if (x.icon)    snprintf(ico, sizeof(ico), "\"ic\":\"%s\",", x.icon);
+    snprintf(p, sizeof(p),
+      "{\"name\":\"%s\",\"uniq_id\":\"lora32r900_%s\",\"stat_t\":\"%s\",\"avty_t\":\"%s\","
+      "\"ent_cat\":\"diagnostic\",%s%s%s\"val_tpl\":\"%s\","
+      "\"dev\":{\"ids\":[\"lora32r900_reader\"]}}",
+      x.name, x.obj, battTopic, availTopic, dca, unt, ico, x.tpl);
+    mqtt.publish(t, p, true);
+  }
+}
+
 // HA connectivity binary_sensor for the board itself (fed by LWT/birth/heartbeat on AVAIL_TOPIC).
 static void publishReaderDiscovery() {
   char p[400];
@@ -198,6 +225,8 @@ static void mqttEnsure() {
     mqtt.publish(availTopic, "online", true);     // birth (retained, overwrites the previous value)
     lastBeat = millis();
     publishReaderDiscovery();
+    publishBattDiscovery();
+    publishBatt(); lastBatt = millis();
     publishDiagDiscovery(diagEnabled);           // create or remove the diagnostic sensors per the toggle
   }
 }
@@ -257,8 +286,8 @@ static uint32_t lastAnyMs = 0;        // millis() of ANY meter's last decode (RX
 // rotation AND the config pick-list; persisted to NVS so the pick-list survives reboots. ----
 #define MAX_METERS   8
 #define METER_TTL_MS 900000UL         // 15 min: a meter not heard within this is pruned (stale removal)
-#define ROT_MS       8000             // OLED dwells 8s on each shown meter before rotating to the next
-#define ROT_BLINK_MS 250              // blank the meter label this long on each rotation (visual cue it changed)
+#define ROT_MS       10000             // OLED dwells 10s on each shown meter before rotating to the next
+#define ROT_BLINK_MS 100              // blank the meter label this long on each rotation (visual cue it changed)
 struct MeterSlot { uint32_t id; R900 r; int rssi; uint32_t lastMs; };
 static MeterSlot meters[MAX_METERS];
 static int       nMeters = 0;
@@ -369,7 +398,7 @@ static bool isRecent(float f) {
 static void markVisited(float f) { visitFreq[visitPos] = f; visitAt[visitPos] = millis(); visitPos = (visitPos + 1) % VISIT_MEM; }
 
 // ---- leak LED (the board's one user LED, GPIO25; the red power LED is hardwired = power indicator) ----
-#define LEAK_LED_PIN  25              // LED_BUILTIN on this board (ttgo-lora32-v21new)
+#define LEAK_LED_PIN  25              // LED_BUILTIN on this board (ttgo-lora32-v21new); active-high (HIGH = lit)
 static Ticker  leakTicker;
 static void    leakToggle() { static bool on = false; on = !on; digitalWrite(LEAK_LED_PIN, on); }
 // 0=none -> off, 1=intermittent -> slow flash, 2=continuous/now -> fast flash
@@ -448,9 +477,18 @@ static void renderFrame(bool showMeterTitle) {
     }
   } else {
     MeterSlot &m = meters[curMeterIdx];
-    char l[28]; meterLabel(m.id, l, sizeof(l));                  // nickname if set, else "Meter: <id>"
-    char title[32]; snprintf(title, sizeof(title), "%s%s", (gPreferred && m.id == gPreferred) ? "*" : "", l);
-    if (showMeterTitle) u8g2.drawStr(0, 26, title);              // '*' marks the preferred meter (blanked mid-blink)
+    const char *nk = nickOf(m.id);
+    // Static part (never blinks): the preferred '*' plus the "Meter: " label — shown for BOTH ids and
+    // nicknames. Only the id/nickname VALUE blinks on rotation.
+    char l[28];
+    char stat[16]; snprintf(stat, sizeof(stat), "%sMeter: ", (gPreferred && m.id == gPreferred) ? "*" : "");
+    u8g2.drawStr(0, 26, stat);
+    if (showMeterTitle) {
+      char val[16];
+      if (nk) snprintf(val, sizeof(val), "%s", nk);
+      else    snprintf(val, sizeof(val), "%u", (unsigned)m.id);
+      u8g2.drawStr(u8g2.getStrWidth(stat), 26, val);            // id/nickname — blanked during the rotation blink
+    }
     char ix[8]; snprintf(ix, sizeof(ix), "%d/%d", rotPos + 1, gVisN);
     u8g2.drawStr(128 - (int)strlen(ix) * 6, 26, ix);             // compact "2/5" indicator, top-right
     snprintf(l, sizeof(l), "Leak: %s", leakText(m.r.leak));      u8g2.drawStr(0, 38, l);
@@ -474,6 +512,25 @@ static void drawDisplay() {
   if (blink) { renderFrame(false); delay(ROT_BLINK_MS); } // flash the label blank, then draw the new one
   renderFrame(true);
 }
+
+#ifdef SCREENSHOT
+// DEV/DOCS ONLY (build env:screenshot): whenever the OLED image changes, dump the raw 1024-byte
+// U8g2 framebuffer as hex over serial so experiments/capture_screens.py can rebuild it as a PNG.
+// Not compiled into the normal firmware. Call this from every loop; it self-throttles + de-dupes.
+static void maybeDumpScreen() {
+  if (!oledPresent) return;
+  static uint32_t prevHash = 1; static uint32_t lastMs = 0;
+  if (millis() - lastMs < 250) return;                 // throttle
+  uint8_t *b = u8g2.getBufferPtr();
+  const int N = u8g2.getBufferTileWidth() * u8g2.getBufferTileHeight() * 8;   // 16*8*8 = 1024
+  uint32_t h = 2166136261u; for (int i = 0; i < N; i++) h = (h ^ b[i]) * 16777619u;  // FNV-1a
+  if (h == prevHash) return;                           // screen unchanged since last dump
+  prevHash = h; lastMs = millis();
+  Serial.printf("---SCREEN %d %d---\n", 128, 64);
+  for (int i = 0; i < N; i++) Serial.printf("%02x", b[i]);
+  Serial.println("\n---ENDSCREEN---");
+}
+#endif
 
 // shown on the OLED while the config portal is open (double-tap RST / FORCE_SETUP)
 static void portalOnOLED() {
@@ -761,6 +818,9 @@ static void runPortal() {
   for (;;) {
     dnsServer.processNextRequest();
     webServer.handleClient();
+#ifdef SCREENSHOT
+    maybeDumpScreen();
+#endif
     R900 r; int rssi;
     if (captureOnce(&r, &rssi, 250) == 1) {          // short idle keeps the web server responsive
       upsertMeter(r, rssi); saveGoodFreq(watchFreq); lastHeard = millis();
@@ -929,6 +989,21 @@ static void hopToNextFreq() {
   Serial.printf("=> hopped to %.3f MHz (ranked; skipped %d interferer/dirty)\n", watchFreq, skipped);
 }
 
+// Battery voltage via GPIO35 (VBAT/2 through 100K+100K divider). Average 16 samples for noise.
+// Power source heuristic: TP4054 holds VBAT at ~4.2V while charging from USB; below 4100mV = battery only.
+static void publishBatt() {
+  if (!mqtt.connected()) return;
+  uint32_t sum = 0;
+  for (int i = 0; i < 16; i++) sum += analogReadMilliVolts(BATT_PIN);
+  uint32_t half_mv = sum / 16;
+  uint32_t vbat_mv = half_mv * 2;
+  int pct = constrain((int)((vbat_mv - 3300) * 100 / (4200 - 3300)), 0, 100);
+  const char *src = (vbat_mv > 4100) ? "usb" : "batt";
+  char p[64];
+  snprintf(p, sizeof(p), "{\"pct\":%d,\"mv\":%lu,\"src\":\"%s\"}", pct, (unsigned long)vbat_mv, src);
+  mqtt.publish(battTopic, p, true);
+}
+
 // publish the diagnostic JSON (watched freq, last-known-good, seconds since last decode)
 static void publishDiag() {
   if (!diagEnabled || !mqtt.connected()) return;
@@ -1046,6 +1121,7 @@ static void serviceMqtt() {
     mqtt.loop();                       // services keepalive PINGs
     if (millis() - lastBeat > 300000) { mqtt.publish(availTopic, "online", true); lastBeat = millis(); }   // 5-min heartbeat
     if (diagEnabled && millis() - lastDiag > 30000) { publishDiag(); lastDiag = millis(); }                // 30s diagnostics
+    if (millis() - lastBatt > BATT_MS) { publishBatt(); lastBatt = millis(); }                            // 5-min battery
   }
 }
 
@@ -1179,6 +1255,9 @@ void loop() {
 #else
 void loop() {
   serviceMqtt();
+#ifdef SCREENSHOT
+  maybeDumpScreen();
+#endif
   R900 r; int rssi;
   int res = captureOnce(&r, &rssi, 3000);     // returns within ~3s if idle so MQTT/OLED stay serviced
   if (res == 0) chanNoDecode++;               // burst arrived here but didn't decode
@@ -1192,7 +1271,9 @@ void loop() {
     return;
   }
   if (res < 0) {                              // idle: refresh display, check the hop timer
-    tickRotation(); updateLeakLed(); drawDisplay();
+    tickRotation(); updateLeakLed();
+    static uint32_t lastDraw = 0;
+    if (millis() - lastDraw >= 10000) { drawDisplay(); lastDraw = millis(); }
     // watch-all: measure time PARKED (chanArriveMs) so continuous decodes don't pin us to one window;
     // watching a specific meter: measure time since its last decode (lastDecodeRef) to park & hold.
     uint32_t held = millis() - (watchAll() ? chanArriveMs : lastDecodeRef);
