@@ -25,6 +25,7 @@
 #ifdef OPTIONB
 #include <Arduino.h>
 #include <SPI.h>
+#include <soc/gpio_struct.h>  // Declares the ESP32 GPIO register used by fastRssi()
 #include <RadioLib.h>   // RADIOLIB_LOW_LEVEL=1 (build flag) exposes getMod() for direct register access
 #include <WiFi.h>
 #include <WebServer.h>     // custom config portal (replaces WiFiManager): serves the SPA + JSON API
